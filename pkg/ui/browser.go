@@ -115,7 +115,13 @@ func (m BrowserModel) View() string {
 	if m.err != nil {
 		content = fmt.Sprintf("\nError: %v\n", m.err)
 	} else {
-		content = m.styles.title.Render(m.currentPath) + "\n\n"
+		content = lipgloss.NewStyle().
+			Width(m.viewport.Width).
+			Align(lipgloss.Center).
+			Render(m.styles.title.Render(m.currentPath)) + "\n\n"
+
+		var entries []string
+		maxWidth := 0
 		for i, entry := range m.entries {
 			cursor := " "
 			if i == m.cursor {
@@ -129,8 +135,18 @@ func (m BrowserModel) View() string {
 				name = m.styles.file.Render(name)
 			}
 
-			content += fmt.Sprintf("%s %s\n", cursor, name)
+			line := fmt.Sprintf("%s %s", cursor, name)
+			entries = append(entries, line)
+			if len(line) > maxWidth {
+				maxWidth = len(line)
+			}
 		}
+
+		entriesContent := strings.Join(entries, "\n")
+		content += lipgloss.NewStyle().
+			Width(m.viewport.Width).
+			Align(lipgloss.Center).
+			Render(entriesContent)
 	}
 
 	m.viewport.SetContent(content)
