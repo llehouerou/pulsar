@@ -2,6 +2,8 @@ package ui
 
 import (
 	tea "github.com/charmbracelet/bubbletea"
+
+	"github.com/llehouerou/pulsar/pkg/db"
 )
 
 type Screen int
@@ -17,10 +19,10 @@ type Model struct {
 	player        PlayerModel
 }
 
-func NewModel() Model {
+func NewModel(database *db.DB) Model {
 	return Model{
 		currentScreen: BrowserScreen,
-		browser:       NewBrowserModel(),
+		browser:       NewBrowserModel(database),
 		player:        NewPlayerModel(),
 	}
 }

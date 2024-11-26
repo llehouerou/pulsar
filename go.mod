@@ -8,6 +8,7 @@ require (
 	github.com/charmbracelet/bubbletea v1.2.4
 	github.com/charmbracelet/lipgloss v1.0.0
 	github.com/gopxl/beep/v2 v2.1.0
+	github.com/mattn/go-sqlite3 v1.14.24
 )
 
 require (

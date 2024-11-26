@@ -10,6 +10,8 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+
+	"github.com/llehouerou/pulsar/pkg/db"
 )
 
 type entry struct {
@@ -25,6 +27,7 @@ type BrowserModel struct {
 	err          error
 	viewport     viewport.Model
 	ready        bool
+	db           *db.DB
 	styles       struct {
 		directory lipgloss.Style
 		file      lipgloss.Style
@@ -33,15 +36,25 @@ type BrowserModel struct {
 	}
 }
 
-func NewBrowserModel() BrowserModel {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		home = "/"
-	}
+func NewBrowserModel(db *db.DB) BrowserModel {
 	m := BrowserModel{
-		currentPath: home,
-		cursor:      0,
+		cursor: 0,
+		db:     db,
 	}
+
+	// Try to load last directory from database
+	if lastDir, err := db.GetSetting("last_directory"); err == nil &&
+		lastDir != "" {
+		m.currentPath = lastDir
+	} else {
+		// Fall back to home directory
+		home, err := os.UserHomeDir()
+		if err != nil {
+			home = "/"
+		}
+		m.currentPath = home
+	}
+
 	m.styles.directory = lipgloss.NewStyle().Foreground(lipgloss.Color("12"))
 	m.styles.file = lipgloss.NewStyle().Foreground(lipgloss.Color("7"))
 	m.styles.cursor = lipgloss.NewStyle().Foreground(lipgloss.Color("11"))
@@ -83,6 +96,8 @@ func (m *BrowserModel) Update(msg tea.Msg) (BrowserModel, tea.Cmd) {
 			if m.currentPath != "/" {
 				m.currentPath = filepath.Dir(m.currentPath)
 				m.loadEntries()
+				// Save new directory
+				m.db.SaveSetting("last_directory", m.currentPath)
 			}
 		case "enter":
 			selected := m.entries[m.cursor]
@@ -90,6 +105,8 @@ func (m *BrowserModel) Update(msg tea.Msg) (BrowserModel, tea.Cmd) {
 			if selected.isDir {
 				m.currentPath = fullPath
 				m.loadEntries()
+				// Save new directory
+				m.db.SaveSetting("last_directory", m.currentPath)
 			} else {
 				m.selectedFile = fullPath
 			}
@@ -145,7 +162,8 @@ func (m BrowserModel) View() string {
 		entriesContent := strings.Join(entries, "\n")
 		content += lipgloss.NewStyle().
 			Width(m.viewport.Width).
-			Align(lipgloss.Center).
+			MarginLeft(10).
+			MarginRight(10).
 			Render(entriesContent)
 	}
 
