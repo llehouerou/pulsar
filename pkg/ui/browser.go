@@ -1,72 +1,102 @@
 package ui
 
 import (
+	"context"
 	"fmt"
-	"os"
-	"path/filepath"
-	"sort"
 	"strings"
+	"time"
 
+	"github.com/charmbracelet/bubbles/progress"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
-	"github.com/llehouerou/pulsar/pkg/db"
+	"github.com/llehouerou/pulsar/pkg/media"
+	"github.com/llehouerou/pulsar/pkg/ui/common"
 )
 
-type entry struct {
-	name  string
-	isDir bool
-}
+type BrowserMode int
+
+const (
+	SourcesMode BrowserMode = iota
+	TracksMode
+)
+
+const (
+	scrollMargin = 3 // Number of lines to keep as margin at top and bottom
+)
 
 type BrowserModel struct {
-	currentPath  string
-	entries      []entry
-	cursor       int
-	selectedFile string
-	err          error
-	viewport     viewport.Model
-	ready        bool
-	db           *db.DB
-	styles       struct {
-		directory lipgloss.Style
-		file      lipgloss.Style
-		cursor    lipgloss.Style
-		title     lipgloss.Style
+	mode          BrowserMode
+	sources       []media.SourceConfig
+	tracks        []media.Track
+	currentSource string
+	sourceCursor  int
+	trackCursor   int
+	selectedTrack string
+	err           error
+	viewport      viewport.Model
+	ready         bool
+	manager       *media.SourceManager
+	progress      progress.Model
+	scanning      bool
+	styles        struct {
+		title    lipgloss.Style
+		source   lipgloss.Style
+		track    lipgloss.Style
+		cursor   lipgloss.Style
+		metadata lipgloss.Style
+		progress lipgloss.Style
+		status   lipgloss.Style
 	}
 }
 
-func NewBrowserModel(db *db.DB) BrowserModel {
+type scanTickMsg struct{}
+
+func scanTick() tea.Cmd {
+	return tea.Tick(time.Second/10, func(time.Time) tea.Msg {
+		return scanTickMsg{}
+	})
+}
+
+func NewBrowserModel(manager *media.SourceManager) BrowserModel {
 	m := BrowserModel{
-		cursor: 0,
-		db:     db,
+		mode:         SourcesMode,
+		sourceCursor: 0,
+		trackCursor:  0,
+		manager:      manager,
+		progress: progress.New(
+			progress.WithScaledGradient("#FF7CCB", "#FDFF8C"),
+		),
 	}
 
-	// Try to load last directory from database
-	if lastDir, err := db.GetSetting("last_directory"); err == nil &&
-		lastDir != "" {
-		m.currentPath = lastDir
-	} else {
-		// Fall back to home directory
-		home, err := os.UserHomeDir()
-		if err != nil {
-			home = "/"
-		}
-		m.currentPath = home
-	}
-
-	m.styles.directory = lipgloss.NewStyle().Foreground(lipgloss.Color("12"))
-	m.styles.file = lipgloss.NewStyle().Foreground(lipgloss.Color("7"))
-	m.styles.cursor = lipgloss.NewStyle().Foreground(lipgloss.Color("11"))
 	m.styles.title = lipgloss.NewStyle().
 		Bold(true).
 		Underline(true).
 		MarginBottom(1)
-	m.loadEntries()
+	m.styles.source = lipgloss.NewStyle().Foreground(lipgloss.Color("12"))
+	m.styles.track = lipgloss.NewStyle().Foreground(lipgloss.Color("7"))
+	m.styles.cursor = lipgloss.NewStyle().Foreground(lipgloss.Color("11"))
+	m.styles.metadata = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
+	m.styles.progress = lipgloss.NewStyle().MarginTop(1)
+	m.styles.status = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
+
+	m.loadSources()
 	return m
 }
 
-func (m *BrowserModel) Init() tea.Cmd {
+func (m *BrowserModel) loadSources() {
+	m.sources = m.manager.GetSources()
+	m.sourceCursor = 0
+}
+
+func (m *BrowserModel) loadTracks() error {
+	tracks, err := m.manager.GetTracks(m.currentSource)
+	if err != nil {
+		return err
+	}
+	m.tracks = tracks
+	m.trackCursor = 0
 	return nil
 }
 
@@ -74,53 +104,127 @@ func (m *BrowserModel) Update(msg tea.Msg) (BrowserModel, tea.Cmd) {
 	var cmd tea.Cmd
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
+		headerHeight := 4 // Title + spacing
 		if !m.ready {
-			m.viewport = viewport.New(msg.Width, msg.Height)
+			m.viewport = viewport.New(msg.Width, msg.Height-headerHeight)
 			m.viewport.Style = lipgloss.NewStyle().Align(lipgloss.Center)
+			m.progress.Width = msg.Width - 20
 			m.ready = true
 		} else {
 			m.viewport.Width = msg.Width
-			m.viewport.Height = msg.Height
+			m.viewport.Height = msg.Height - headerHeight
+			m.progress.Width = msg.Width - 20
 		}
+
+	case common.ScanTickMsg:
+		if m.scanning {
+			if progress := m.manager.GetScanProgress(); progress != nil {
+				return *m, common.ScanTick()
+			}
+			// Scanning finished
+			m.scanning = false
+			if err := m.loadTracks(); err != nil {
+				m.err = err
+			}
+		}
+
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "up":
-			if m.cursor > 0 {
-				m.cursor--
+			switch m.mode {
+			case SourcesMode:
+				if m.sourceCursor > 0 {
+					m.sourceCursor--
+					// Update viewport position
+					if m.sourceCursor < m.viewport.YOffset+scrollMargin {
+						m.viewport.YOffset = max(0, m.sourceCursor-scrollMargin)
+					}
+				}
+			case TracksMode:
+				if m.trackCursor > 0 {
+					m.trackCursor--
+					// Update viewport position
+					if m.trackCursor < m.viewport.YOffset+scrollMargin {
+						m.viewport.YOffset = max(0, m.trackCursor-scrollMargin)
+					}
+				}
 			}
 		case "down":
-			if m.cursor < len(m.entries)-1 {
-				m.cursor++
+			switch m.mode {
+			case SourcesMode:
+				if m.sourceCursor < len(m.sources)-1 {
+					m.sourceCursor++
+					// Update viewport position
+					if m.sourceCursor >= m.viewport.YOffset+m.viewport.Height-scrollMargin {
+						maxOffset := max(0, len(m.sources)-m.viewport.Height+scrollMargin)
+						m.viewport.YOffset = min(
+							m.sourceCursor-m.viewport.Height+1+scrollMargin,
+							maxOffset,
+						)
+					}
+				}
+			case TracksMode:
+				if m.trackCursor < len(m.tracks)-1 {
+					m.trackCursor++
+					// Update viewport position
+					if m.trackCursor >= m.viewport.YOffset+m.viewport.Height-scrollMargin {
+						maxOffset := max(0, len(m.tracks)-m.viewport.Height+scrollMargin)
+						m.viewport.YOffset = min(
+							m.trackCursor-m.viewport.Height+1+scrollMargin,
+							maxOffset,
+						)
+					}
+				}
 			}
-		case "backspace":
-			if m.currentPath != "/" {
-				m.currentPath = filepath.Dir(m.currentPath)
-				m.loadEntries()
-				// Save new directory
-				m.db.SaveSetting("last_directory", m.currentPath)
+		case "backspace", "esc":
+			if m.mode == TracksMode {
+				m.mode = SourcesMode
+				m.currentSource = ""
+				m.viewport.YOffset = 0
 			}
 		case "enter":
-			selected := m.entries[m.cursor]
-			fullPath := filepath.Join(m.currentPath, selected.name)
-			if selected.isDir {
-				m.currentPath = fullPath
-				m.loadEntries()
-				// Save new directory
-				m.db.SaveSetting("last_directory", m.currentPath)
-			} else {
-				m.selectedFile = fullPath
+			switch m.mode {
+			case SourcesMode:
+				if len(m.sources) > 0 && m.sourceCursor < len(m.sources) {
+					m.currentSource = m.sources[m.sourceCursor].ID
+					m.mode = TracksMode
+					m.viewport.YOffset = 0
+					if err := m.loadTracks(); err != nil {
+						m.err = err
+					}
+				}
+			case TracksMode:
+				if len(m.tracks) > 0 && m.trackCursor < len(m.tracks) {
+					m.selectedTrack = m.tracks[m.trackCursor].Path
+				}
+			}
+		case "a":
+			if m.mode == SourcesMode {
+				m.selectedTrack = "ADD_SOURCE"
+			}
+		case "r":
+			if m.mode == TracksMode && !m.scanning {
+				m.scanning = true
+				go m.manager.ScanSource(context.Background(), m.currentSource)
+				return *m, common.ScanTick()
 			}
 		}
 	}
 	return *m, cmd
 }
 
-func (m *BrowserModel) SelectedFile() (bool, string) {
-	return m.selectedFile != "", m.selectedFile
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
 
-func (m *BrowserModel) ClearSelection() {
-	m.selectedFile = ""
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func (m BrowserModel) View() string {
@@ -132,80 +236,87 @@ func (m BrowserModel) View() string {
 	if m.err != nil {
 		content = fmt.Sprintf("\nError: %v\n", m.err)
 	} else {
-		content = lipgloss.NewStyle().
-			Width(m.viewport.Width).
-			Align(lipgloss.Center).
-			Render(m.styles.title.Render(m.currentPath)) + "\n\n"
+		title := ""
+		switch m.mode {
+		case SourcesMode:
+			title = "Music Sources"
+			var list strings.Builder
+			for i, source := range m.sources {
+				cursor := " "
+				if i == m.sourceCursor {
+					cursor = m.styles.cursor.Render(">")
+				}
+				name := m.styles.source.Render(source.Name)
+				list.WriteString(fmt.Sprintf("%s %s\n", cursor, name))
+			}
+			if len(m.sources) == 0 {
+				list.WriteString("No sources configured. Press 'a' to add a source.")
+			}
+			content = list.String()
 
-		var entries []string
-		maxWidth := 0
-		for i, entry := range m.entries {
-			cursor := " "
-			if i == m.cursor {
-				cursor = m.styles.cursor.Render(">")
+		case TracksMode:
+			if m.sourceCursor >= len(m.sources) {
+				content = "No source selected."
+				break
 			}
 
-			name := entry.name
-			if entry.isDir {
-				name = m.styles.directory.Render(name)
-			} else {
-				name = m.styles.file.Render(name)
+			source := m.sources[m.sourceCursor]
+			title = source.Name
+
+			var list strings.Builder
+			// Show scanning progress if active
+			if progress := m.manager.GetScanProgress(); progress != nil && progress.SourceID == m.currentSource {
+				var percent float64
+				if progress.Total > 0 {
+					percent = float64(progress.Current) / float64(progress.Total)
+				}
+				list.WriteString(m.styles.progress.Render(m.progress.ViewAs(percent)) + "\n")
+				list.WriteString(m.styles.status.Render(
+					fmt.Sprintf(
+						"%s (%d/%d files)\n\n",
+						progress.Status,
+						progress.Current,
+						progress.Total,
+					),
+				))
 			}
 
-			line := fmt.Sprintf("%s %s", cursor, name)
-			entries = append(entries, line)
-			if len(line) > maxWidth {
-				maxWidth = len(line)
+			for i, track := range m.tracks {
+				cursor := " "
+				if i == m.trackCursor {
+					cursor = m.styles.cursor.Render(">")
+				}
+				title := track.Title
+				if title == "" {
+					title = "Unknown Title"
+				}
+				artist := track.Artist
+				if artist == "" {
+					artist = "Unknown Artist"
+				}
+
+				trackInfo := m.styles.track.Render(title)
+				metadata := m.styles.metadata.Render(fmt.Sprintf(" - %s", artist))
+				list.WriteString(fmt.Sprintf("%s %s%s\n", cursor, trackInfo, metadata))
 			}
+			if len(m.tracks) == 0 {
+				list.WriteString("No tracks found. Press 'r' to rescan.")
+			}
+			content = list.String()
 		}
 
-		entriesContent := strings.Join(entries, "\n")
-		content += lipgloss.NewStyle().
-			Width(m.viewport.Width).
-			MarginLeft(10).
-			MarginRight(10).
-			Render(entriesContent)
+		// Add title above viewport
+		content = m.styles.title.Render(title) + "\n\n" + content
 	}
 
 	m.viewport.SetContent(content)
 	return m.viewport.View()
 }
 
-func isAudioFile(name string) bool {
-	ext := filepath.Ext(name)
-	return ext == ".mp3"
+func (m *BrowserModel) SelectedFile() (bool, string) {
+	return m.selectedTrack != "", m.selectedTrack
 }
 
-func (m *BrowserModel) loadEntries() {
-	entries, err := os.ReadDir(m.currentPath)
-	if err != nil {
-		m.err = err
-		return
-	}
-
-	var dirs, files []entry
-	for _, e := range entries {
-		name := e.Name()
-		// Skip hidden files and directories
-		if strings.HasPrefix(name, ".") {
-			continue
-		}
-
-		if e.IsDir() {
-			dirs = append(dirs, entry{name: name, isDir: true})
-		} else if isAudioFile(name) {
-			files = append(files, entry{name: name, isDir: false})
-		}
-	}
-
-	// Sort directories and files separately
-	sort.Slice(dirs, func(i, j int) bool { return dirs[i].name < dirs[j].name })
-	sort.Slice(
-		files,
-		func(i, j int) bool { return files[i].name < files[j].name },
-	)
-
-	// Combine directories first, then files
-	m.entries = append(dirs, files...)
-	m.cursor = 0
+func (m *BrowserModel) ClearSelection() {
+	m.selectedTrack = ""
 }

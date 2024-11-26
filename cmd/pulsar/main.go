@@ -34,7 +34,10 @@ func main() {
 	}
 	defer database.Close()
 
-	p := tea.NewProgram(ui.NewModel(database))
+	p := tea.NewProgram(
+		ui.NewModel(database),
+		tea.WithAltScreen(),
+	)
 
 	if _, err := p.Run(); err != nil {
 		fmt.Printf("Error running program: %v", err)
